@@ -1955,12 +1955,19 @@ static ncclResult_t ncclTopoUpdateVNics(ncclXml* xml, struct ncclTopoNetInfo* ne
       if (physNetNode) {
         NCCLCHECK(xmlSetAttrInt(physNetNode, net->net ? "net" : (net->gin ? "gin" : "coll"), 0));
         // net is always present (see ncclTopoPopulateNics).
-        int net = 0, gin = 0, coll = 0;
+        int net = 0, gin = 0, coll = 0, rma = 0;
         NCCLCHECK(xmlGetAttrInt(physNetNode, "net", &net));
         NCCLCHECK(xmlGetAttrIntDefault(physNetNode, "gin", &gin, 0));
         NCCLCHECK(xmlGetAttrIntDefault(physNetNode, "coll", &coll, 0));
+        // RCCL: upstream (v2.30.7-1 and v2.31.2-1) tests only net/gin/coll here. RMA
+        // never builds vNICs of its own (makeVDevice is NULL), so it keeps using the
+        // physical device this vNIC subsumes; trimming the node leaves
+        // ncclTopoGetLocalRmaDev with nothing to return and fails window register.
+        // Do not drop this term on the next NCCL sync -- net_ib_rma_fused_gin_off
+        // covers it. Upstream likely has the same latent issue.
+        NCCLCHECK(xmlGetAttrIntDefault(physNetNode, "rma", &rma, 0));
         // Set "keep = 0" only if no plugin is using the physical device
-        if (net == 0 && gin == 0 && coll == 0) NCCLCHECK(xmlSetAttrInt(physNetNode, "keep", 0));
+        if (net == 0 && gin == 0 && coll == 0 && rma == 0) NCCLCHECK(xmlSetAttrInt(physNetNode, "keep", 0));
       }
     }
   }
