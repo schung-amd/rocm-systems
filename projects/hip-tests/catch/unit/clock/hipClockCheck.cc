@@ -166,3 +166,4 @@ HIP_TEST_CASE(Unit_hipWallClock64_Positive_Basic) { execute_clock_kernels(reduce
  * End doxygen group DeviceLanguageTest.
  * @}
  */
+

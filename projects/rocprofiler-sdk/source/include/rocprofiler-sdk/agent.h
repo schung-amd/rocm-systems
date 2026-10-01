@@ -299,3 +299,4 @@ rocprofiler_query_available_agents(rocprofiler_agent_version_t             versi
 /** @} */
 
 ROCPROFILER_EXTERN_C_FINI
+
