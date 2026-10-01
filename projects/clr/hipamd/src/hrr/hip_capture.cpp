@@ -61,6 +61,8 @@
 #include <mutex>
 #include <string>
 #include <map>
+#include <memory>
+#include <new>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -1577,6 +1579,13 @@ static size_t memcpy3d_byte_count(const struct hipMemcpy3DParms* p) {
   return p->extent.width * p->extent.height * p->extent.depth;
 }
 
+// Defined with the driver-copy helpers below. The runtime widens a hipMemcpy3D
+// to the same HIP_MEMCPY3D, so its host side has the same footprint.
+static hrr_cap::Hash128 write_host_rect_blob(const void* base, size_t pitch,
+                                             size_t pitch_height, size_t x, size_t y,
+                                             size_t z, size_t width, size_t height,
+                                             size_t depth);
+
 // Helper shared by all four 3D variants.
 // Writes H2D blob (src host data) and D2H expected blob (dst host data after copy),
 // then emits the event record.
@@ -1591,15 +1600,26 @@ static void capture_memcpy3d_impl(
   std::memcpy(a.parms_bytes, p, sizeof(a.parms_bytes));
   size_t byte_count = memcpy3d_byte_count(p);
 
-  if (p->kind == hipMemcpyHostToDevice && p->srcPtr.ptr && byte_count > 0) {
-    // H2D: host source is valid at call time — no stream sync needed.
-    auto h = hrr_cap::writer::write_blob(p->srcPtr.ptr, byte_count);
+  if (p->kind == hipMemcpyHostToDevice && p->srcPtr.ptr && byte_count > 0 &&
+      a.ret == hipSuccess) {
+    // H2D: host source is valid at call time, so no stream sync is needed.
+    // Replay reads the blob with the recorded pitch and position, so it spans
+    // srcPtr.ptr through the last copied byte, as the driver copies do.
+    auto h = write_host_rect_blob(p->srcPtr.ptr, p->srcPtr.pitch, p->srcPtr.ysize,
+                                  p->srcPos.x, p->srcPos.y, p->srcPos.z, p->extent.width,
+                                  p->extent.height, p->extent.depth);
     a.blob_hash_lo = h.lo;
     a.blob_hash_hi = h.hi;
-  } else if (p->kind == hipMemcpyDeviceToHost && p->dstPtr.ptr && byte_count > 0) {
+  } else if (p->kind == hipMemcpyDeviceToHost && p->dstPtr.ptr && byte_count > 0 &&
+             a.ret == hipSuccess) {
     // D2H: real call already completed (sync API) or stream sync done below;
     // host buffer now holds GPU result — capture it as the expected output.
-    if (is_async && stream) {
+    // The blob spans dstPtr.ptr through the last copied byte, laid out with the
+    // recorded pitch and position, so replay can compare exactly the copied
+    // rows. A rejected copy is skipped: nothing validated its rect, and that
+    // span can reach past the caller's buffer. The null stream is synchronised
+    // too, as in the driver 3D path below.
+    if (is_async) {
       hipError_t sync_r = g_real_table.hipStreamSynchronize_fn(stream);
       if (sync_r != hipSuccess) {
         LogPrintfWarning("[HRR capture] hipStreamSynchronize failed (%d) — D2H 3D blob skipped",
@@ -1608,7 +1628,9 @@ static void capture_memcpy3d_impl(
         return;
       }
     }
-    auto h = hrr_cap::writer::write_blob(p->dstPtr.ptr, byte_count);
+    auto h = write_host_rect_blob(p->dstPtr.ptr, p->dstPtr.pitch, p->dstPtr.ysize,
+                                  p->dstPos.x, p->dstPos.y, p->dstPos.z, p->extent.width,
+                                  p->extent.height, p->extent.depth);
     a.d2h_hash_lo = h.lo;
     a.d2h_hash_hi = h.hi;
   }
@@ -1673,16 +1695,64 @@ static size_t memcpy2d_host_byte_count(size_t pitch, size_t width, size_t height
 // end whenever pitch > width, height > 1 or an offset is non-zero. The volume is
 // only correct for a fully dense rect, which is also why this never shrinks a
 // blob: for a copy the runtime accepted, footprint >= width*height*depth.
-static size_t drvmemcpy_host_byte_count(size_t pitch, size_t pitch_height,
-                                        size_t x, size_t y, size_t z,
-                                        size_t width, size_t height, size_t depth) {
-  if (width == 0 || height == 0 || depth == 0) return 0;
+//
+// D2H expected outputs use the same footprint of dstHost, so replay can re-run
+// the copy into a buffer laid out the same way and compare exactly the copied
+// rows. An older archive holds the flat volume there, which replay tells apart
+// by its size.
+struct HostRect {
+  size_t row, slice, first, bytes;  // bytes == 0: nothing is copied
+};
+
+static HostRect host_rect(size_t pitch, size_t pitch_height, size_t x, size_t y, size_t z,
+                          size_t width, size_t height, size_t depth) {
+  if (width == 0 || height == 0 || depth == 0) return {0, 0, 0, 0};
   size_t row = (pitch != 0) ? pitch : width;
   if (row < width) row = width;  // defensive: degenerate pitch
   size_t slice = pitch * pitch_height;
   if (slice < row * height) slice = row * height;  // 0 => runtime default
   size_t first = z * slice + y * row + x;          // offset of the first byte
-  return first + (depth - 1) * slice + memcpy2d_host_byte_count(row, width, height);
+  return {row, slice, first,
+          first + (depth - 1) * slice + memcpy2d_host_byte_count(row, width, height)};
+}
+
+static size_t drvmemcpy_host_byte_count(size_t pitch, size_t pitch_height,
+                                        size_t x, size_t y, size_t z,
+                                        size_t width, size_t height, size_t depth) {
+  return host_rect(pitch, pitch_height, x, y, z, width, height, depth).bytes;
+}
+
+// Blob of a host rect's footprint. The footprint also spans bytes the copy never
+// touches: everything before its first byte and the padding between rows and
+// slices. Those can hold unrelated data, or lie on an unmapped guard page, so
+// they are never read: only the copied rows are taken from `base` and every
+// other byte of the blob is zero. Replay uses the blob with the recorded pitches
+// and offsets, so an H2D copy reads back exactly those rows and a D2H check
+// compares exactly those rows; the zeros are never consumed.
+static hrr_cap::Hash128 write_host_rect_blob(const void* base, size_t pitch,
+                                             size_t pitch_height, size_t x, size_t y,
+                                             size_t z, size_t width, size_t height,
+                                             size_t depth) {
+  const HostRect r = host_rect(pitch, pitch_height, x, y, z, width, height, depth);
+  if (r.bytes == 0) return {0, 0};
+  if (r.first == 0 && r.row == width && (depth == 1 || r.slice == width * height)) {
+    return hrr_cap::writer::write_blob(base, r.bytes);  // dense: no gaps to leave out
+  }
+  std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[r.bytes]());
+  if (!buf) {
+    LogPrintfWarning("[HRR capture] cannot allocate %zu bytes to snapshot a pitched host copy",
+                     r.bytes);
+    hrr_cap::writer::mark_incomplete("pitched host copy not recorded");
+    return {0, 0};
+  }
+  const auto* src = static_cast<const uint8_t*>(base);
+  for (size_t k = 0; k < depth; ++k) {
+    for (size_t j = 0; j < height; ++j) {
+      const size_t off = r.first + k * r.slice + j * r.row;
+      std::memcpy(buf.get() + off, src + off, width);
+    }
+  }
+  return hrr_cap::writer::write_blob(buf.get(), r.bytes);
 }
 
 template <typename T>
@@ -1695,18 +1765,18 @@ static void capture_drvmemcpy3d_impl(T& a, hrr_api_id_t api_id,
                                          p->srcY, p->srcZ, p->WidthInBytes,
                                          p->Height, p->Depth);
     if (n > 0) {
-      auto h = hrr_cap::writer::write_blob(p->srcHost, n);
+      auto h = write_host_rect_blob(p->srcHost, p->srcPitch, p->srcHeight, p->srcXInBytes,
+                                    p->srcY, p->srcZ, p->WidthInBytes, p->Height, p->Depth);
       a.blob_hash_lo = h.lo; a.blob_hash_hi = h.hi;
     }
   } else if (p->dstMemoryType == hipMemoryTypeHost && p->dstHost &&
              p->srcMemoryType != hipMemoryTypeArray) {
-    // D2H expected output. Replay does a flat readback of the copied volume
-    // (it never substitutes dstHost), so the blob stays the flat volume to keep
-    // the two sides the same shape. A pitched destination rect is therefore not
-    // validated faithfully; that is a fidelity gap, not a replay over-read.
+    // D2H expected output, the host footprint of the destination rect.
     // An array source is skipped because playback declines array-typed rects,
     // so the blob would be an expected output nothing ever validates.
-    size_t n = p->WidthInBytes * p->Height * p->Depth;
+    size_t n = drvmemcpy_host_byte_count(p->dstPitch, p->dstHeight, p->dstXInBytes,
+                                         p->dstY, p->dstZ, p->WidthInBytes,
+                                         p->Height, p->Depth);
     if (n > 0) {
       // The null stream needs the sync too: hipDrvMemcpy3DAsync(p, nullptr) is
       // still asynchronous, so skipping it can snapshot dstHost before the copy
@@ -1722,7 +1792,8 @@ static void capture_drvmemcpy3d_impl(T& a, hrr_api_id_t api_id,
           return;
         }
       }
-      auto h = hrr_cap::writer::write_blob(p->dstHost, n);
+      auto h = write_host_rect_blob(p->dstHost, p->dstPitch, p->dstHeight, p->dstXInBytes,
+                                    p->dstY, p->dstZ, p->WidthInBytes, p->Height, p->Depth);
       a.d2h_hash_lo = h.lo; a.d2h_hash_hi = h.hi;
     }
   }
@@ -1730,7 +1801,8 @@ static void capture_drvmemcpy3d_impl(T& a, hrr_api_id_t api_id,
 }
 
 template <typename T>
-static void capture_drvmemcpy2d_impl(T& a, hrr_api_id_t api_id, const hip_Memcpy2D* p) {
+static void capture_drvmemcpy2d_impl(T& a, hrr_api_id_t api_id, const hip_Memcpy2D* p,
+                                     bool dst_ready = true) {
   if (!p) { hrr_cap::writer::write_event_raw(api_id, &a.hdr, sizeof(a)); return; }
   std::memcpy(a.drv2d_bytes, p, sizeof(hip_Memcpy2D));
   // hip_Memcpy2D is widened to a HIP_MEMCPY3D by the runtime with Depth == 1,
@@ -1742,14 +1814,19 @@ static void capture_drvmemcpy2d_impl(T& a, hrr_api_id_t api_id, const hip_Memcpy
                                          p->srcY, /*z=*/0, p->WidthInBytes,
                                          p->Height, /*depth=*/1);
     if (n > 0) {
-      auto h = hrr_cap::writer::write_blob(p->srcHost, n);
+      auto h = write_host_rect_blob(p->srcHost, pitch, /*pitch_height=*/0, p->srcXInBytes,
+                                    p->srcY, /*z=*/0, p->WidthInBytes, p->Height, /*depth=*/1);
       a.blob_hash_lo = h.lo; a.blob_hash_hi = h.hi;
     }
-  } else if (p->dstMemoryType == hipMemoryTypeHost && p->dstHost &&
+  } else if (dst_ready && p->dstMemoryType == hipMemoryTypeHost && p->dstHost &&
              p->srcMemoryType != hipMemoryTypeArray) {
-    size_t n = p->WidthInBytes * p->Height;  // flat volume; see the 3D note above
+    size_t pitch = p->dstPitch ? p->dstPitch : p->dstXInBytes + p->WidthInBytes;
+    size_t n = drvmemcpy_host_byte_count(pitch, /*pitch_height=*/0, p->dstXInBytes,
+                                         p->dstY, /*z=*/0, p->WidthInBytes,
+                                         p->Height, /*depth=*/1);
     if (n > 0) {
-      auto h = hrr_cap::writer::write_blob(p->dstHost, n);
+      auto h = write_host_rect_blob(p->dstHost, pitch, /*pitch_height=*/0, p->dstXInBytes,
+                                    p->dstY, /*z=*/0, p->WidthInBytes, p->Height, /*depth=*/1);
       a.d2h_hash_lo = h.lo; a.d2h_hash_hi = h.hi;
     }
   }
@@ -1808,10 +1885,18 @@ hipError_t capture_hipMemcpyParam2DAsync(const hip_Memcpy2D* pCopy,
   a.ret = static_cast<int32_t>(r);
   a.stream = reinterpret_cast<uint64_t>(stream);
   // A D2H blob taken before the copy lands would record a stale expected
-  // output, the same reason the async 3D spelling synchronises first.
-  if (pCopy && pCopy->dstMemoryType == hipMemoryTypeHost && stream)
-    (void)g_real_table.hipStreamSynchronize_fn(stream);
-  capture_drvmemcpy2d_impl(a, HRR_API_HIPMEMCPYPARAM2DASYNC, pCopy);
+  // output, the same reason the async 3D spelling synchronises first. The null
+  // stream is asynchronous too, and a failed sync leaves no blob to take.
+  bool dst_ready = true;
+  if (pCopy && pCopy->dstMemoryType == hipMemoryTypeHost) {
+    hipError_t sync_r = g_real_table.hipStreamSynchronize_fn(stream);
+    if (sync_r != hipSuccess) {
+      LogPrintfWarning("[HRR capture] hipStreamSynchronize failed (%d): D2H param 2D blob skipped",
+                       sync_r);
+      dst_ready = false;
+    }
+  }
+  capture_drvmemcpy2d_impl(a, HRR_API_HIPMEMCPYPARAM2DASYNC, pCopy, dst_ready);
   return r;
 }
 
@@ -1841,7 +1926,7 @@ static void capture_memcpy2d_impl(
   if (kind == hipMemcpyHostToDevice && src) {
     size_t n = memcpy2d_host_byte_count(spitch, width, height);
     if (n > 0) {
-      auto h = hrr_cap::writer::write_blob(src, n);
+      auto h = write_host_rect_blob(src, spitch, 0, 0, 0, 0, width, height, 1);
       a.blob_hash_lo = h.lo;
       a.blob_hash_hi = h.hi;
       hrr_trace_h2d(is_async ? "hipMemcpy2DAsync" : "hipMemcpy2D", dst, n);
@@ -1849,7 +1934,7 @@ static void capture_memcpy2d_impl(
   } else if (kind == hipMemcpyDeviceToHost && dst) {
     size_t n = memcpy2d_host_byte_count(dpitch, width, height);
     if (n > 0) {
-      if (is_async && stream) {
+      if (is_async) {
         hipError_t sync_r = g_real_table.hipStreamSynchronize_fn(stream);
         if (sync_r != hipSuccess) {
           LogPrintfWarning("[HRR capture] hipStreamSynchronize failed (%d) — D2H 2D blob skipped",
@@ -1858,7 +1943,7 @@ static void capture_memcpy2d_impl(
           return;
         }
       }
-      auto h = hrr_cap::writer::write_blob(dst, n);
+      auto h = write_host_rect_blob(dst, dpitch, 0, 0, 0, 0, width, height, 1);
       a.d2h_hash_lo = h.lo;
       a.d2h_hash_hi = h.hi;
     }
