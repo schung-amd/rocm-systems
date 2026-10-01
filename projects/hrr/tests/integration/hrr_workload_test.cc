@@ -3429,3 +3429,120 @@ TEST_CASE("Unit_HRR_ChevronLaunch_Direct", "[.][hrr][direct]") {
   HRR_HIP_CHECK(hipFree(d));
   HRR_HIP_CHECK(hipStreamDestroy(s));
 }
+
+// ---------------------------------------------------------------------------
+// A hipMemcpy3D the runtime rejects, its extent far larger than both buffers.
+// Unit_HRR_FailedMemcpy3DNotRecorded checks that capture does not record it.
+// ---------------------------------------------------------------------------
+TEST_CASE("Unit_HRR_FailedMemcpy3D_Direct", "[.][hrr-direct]") {
+  HRR_HIP_CHECK(hipSetDevice(0));
+  hipPitchedPtr dst{};
+  HRR_HIP_CHECK(hipMalloc3D(&dst, make_hipExtent(64, 4, 1)));
+  std::vector<char> host(4096, 1);
+
+  hipMemcpy3DParms p{};
+  p.srcPtr = make_hipPitchedPtr(host.data(), size_t{1} << 20, size_t{1} << 20, size_t{1} << 12);
+  p.dstPtr = dst;
+  p.extent = make_hipExtent(size_t{1} << 20, size_t{1} << 12, 1);  // 4 GiB
+  p.kind = hipMemcpyHostToDevice;
+  REQUIRE(hipMemcpy3D(&p) == hipErrorInvalidValue);
+  (void)hipGetLastError();
+
+  HRR_HIP_CHECK(hipFree(dst.ptr));
+}
+
+// ---------------------------------------------------------------------------
+// A host-to-device hipMemcpy3DAsync in a stream capture whose width * height *
+// depth overflows size_t. The runtime accepts it: it validates with the same
+// wrapping product and only adds a graph node, which is never launched.
+// Unit_HRR_OverflowingMemcpy3DNotRecorded checks that capture drops it.
+// ---------------------------------------------------------------------------
+TEST_CASE("Unit_HRR_OverflowingMemcpy3D_Direct", "[.][hrr-direct]") {
+  HRR_HIP_CHECK(hipSetDevice(0));
+  hipStream_t stream = nullptr;
+  HRR_HIP_CHECK(hipStreamCreate(&stream));
+  void* dst = nullptr;
+  HRR_HIP_CHECK(hipMalloc(&dst, 1024));
+  std::vector<char> host(1024, 1);
+
+  hipMemcpy3DParms p{};
+  p.srcPtr = make_hipPitchedPtr(host.data(), 256, 256, 4);
+  p.dstPtr = make_hipPitchedPtr(dst, 256, 256, 4);
+  p.extent = make_hipExtent(256, (size_t{1} << 56) + 1, 1);  // 2^64 + 256 bytes
+  p.kind = hipMemcpyHostToDevice;
+  HRR_HIP_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+  HRR_HIP_CHECK(hipMemcpy3DAsync(&p, stream));
+  hipGraph_t graph = nullptr;
+  HRR_HIP_CHECK(hipStreamEndCapture(stream, &graph));
+  HRR_HIP_CHECK(hipGraphDestroy(graph));
+
+  HRR_HIP_CHECK(hipFree(dst));
+  HRR_HIP_CHECK(hipStreamDestroy(stream));
+}
+
+// ---------------------------------------------------------------------------
+// One call the runtime rejects for each hand-written shim that inlines a struct,
+// next to accepted calls on the same pool and stream, one of them setting a
+// 4-byte reuse-policy attribute. Unit_HRR_FailedShimCallsNotRecorded checks that
+// capture records only the accepted calls.
+// ---------------------------------------------------------------------------
+TEST_CASE("Unit_HRR_FailedShimCalls_Direct", "[.][hrr-direct]") {
+  HRR_HIP_CHECK(hipSetDevice(0));
+  hipMemPoolProps props{};
+  props.allocType = hipMemAllocationTypePinned;
+  props.location.type = hipMemLocationTypeDevice;
+  props.location.id = 0;
+  hipMemPool_t pool = nullptr;
+  HRR_HIP_CHECK(hipMemPoolCreate(&pool, &props));
+  int32_t opportunistic = 1;
+  HRR_HIP_CHECK(hipMemPoolSetAttribute(pool, hipMemPoolReuseAllowOpportunistic, &opportunistic));
+  hipStream_t stream = nullptr;
+  HRR_HIP_CHECK(hipStreamCreate(&stream));
+
+  hipMemPoolProps bad_props = props;
+  bad_props.allocType = hipMemAllocationTypeInvalid;
+  hipMemPool_t bad_pool = nullptr;
+  REQUIRE(hipMemPoolCreate(&bad_pool, &bad_props) == hipErrorInvalidValue);
+
+  uint64_t used_high = 1;  // only 0 is accepted
+  REQUIRE(hipMemPoolSetAttribute(pool, hipMemPoolAttrUsedMemHigh, &used_high) ==
+          hipErrorInvalidValue);
+
+  hipMemAccessDesc bad_access{};  // location.type is hipMemLocationTypeInvalid
+  bad_access.flags = hipMemAccessFlagsProtReadWrite;
+  REQUIRE(hipMemPoolSetAccess(pool, &bad_access, 1) == hipErrorInvalidValue);
+  REQUIRE(hipMemSetAccess(nullptr, 4096, &bad_access, 1) == hipErrorInvalidValue);
+
+  HIP_ARRAY_DESCRIPTOR array_desc{};
+  array_desc.Width = 64;
+  array_desc.Height = 64;
+  array_desc.Format = HIP_AD_FORMAT_FLOAT;
+  array_desc.NumChannels = 3;  // only 1, 2 or 4
+  hipArray_t array = nullptr;
+  REQUIRE(hipArrayCreate(&array, &array_desc) == hipErrorInvalidValue);
+
+  HIP_ARRAY3D_DESCRIPTOR array3d_desc{};
+  array3d_desc.Width = 16;
+  array3d_desc.Height = 16;
+  array3d_desc.Depth = 16;
+  array3d_desc.Format = HIP_AD_FORMAT_FLOAT;
+  array3d_desc.NumChannels = 3;
+  REQUIRE(hipArray3DCreate(&array, &array3d_desc) == hipErrorInvalidValue);
+
+  hipStreamAttrValue sync{};
+  sync.syncPolicy = static_cast<hipSynchronizationPolicy>(hipSyncPolicyBlockingSync + 1);
+  REQUIRE(hipStreamSetAttribute(stream, hipStreamAttributeSynchronizationPolicy, &sync) ==
+          hipErrorInvalidValue);
+
+  hipMemAllocationProp alloc_prop{};  // type is hipMemAllocationTypeInvalid
+  alloc_prop.location.type = hipMemLocationTypeDevice;
+  alloc_prop.location.id = 0;
+  size_t granularity = 0;
+  REQUIRE(hipMemGetAllocationGranularity(&granularity, &alloc_prop,
+                                         hipMemAllocationGranularityMinimum) ==
+          hipErrorInvalidValue);
+  (void)hipGetLastError();
+
+  HRR_HIP_CHECK(hipStreamDestroy(stream));
+  HRR_HIP_CHECK(hipMemPoolDestroy(pool));
+}
