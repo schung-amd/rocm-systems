@@ -16,7 +16,8 @@ namespace hrr_cap {
 namespace writer {
 
 // Open events.bin for writing in output_dir. Creates directory tree.
-// Must be called before any write_* functions.
+// Must be called before any write_* functions. Returns false, leaving capture
+// off, when the file system holding the archive has less than the reserve free.
 bool open(const char* output_dir);
 
 // Returns true if open() has been called successfully.
@@ -87,11 +88,12 @@ bool is_incomplete();
 // per process.
 void note_unreplayable(const char* api, const char* reason);
 
-// Write a buffer as a content-addressed blob. Returns hash.
+// Write a buffer as a content-addressed blob. Returns hash, or {} when the
+// writer is not open or capture has stopped for lack of space.
 // Thread-safe. Skips write if blob already exists on disk.
 Hash128 write_blob(const void* data, size_t len);
 
-// Write a code object (.hsaco) blob. Returns hash.
+// Write a code object (.hsaco) blob. Returns hash, or {} as write_blob() does.
 Hash128 write_code_object(const void* image, size_t image_size);
 
 // Number of events written so far.
