@@ -360,7 +360,7 @@ tiers:
       --include-deprioritised.
     # Coverage floor: what the deprioritised workload reaches on a part with
     # no image support. On one with images it should jump by ~70.
-    min_covered: 14
+    min_covered: 12
     gpus: 1
     skip_by_default: true
     workloads:
@@ -419,12 +419,14 @@ unreachable:
       that creates or configures texture state returns 801
       (hipErrorNotSupported) and the capture shim writes no event, so the
       whole texture, surface and mipmap creation surface is unreachable here
-      rather than merely untested. Two spellings escape this and are covered:
-      hipArrayCreate and hipArray3DCreate are recorded before the runtime
-      rejects them, as are the three destroy entry points, which accept a null
-      handle. This is also why section 10's deprioritisation of textures costs
+      rather than merely untested. hipArrayCreate and hipArray3DCreate are in
+      this group too: capture records only calls that succeed, so their 801
+      leaves no event either. The three destroy entry points escape it, since
+      they accept a null handle. This is also why section 10's deprioritisation of textures costs
       nothing on Instinct hardware: the family does not run there.
     apis:
+      - hipArrayCreate
+      - hipArray3DCreate
       - hipMallocArray
       - hipMalloc3DArray
       - hipMallocMipmappedArray
@@ -473,8 +475,7 @@ unreachable:
       Takes a hipArray_t, hipMipmappedArray_t or texture object as its subject,
       and on a part without image support no such handle can exist. Called with
       a null one the runtime returns 400 (invalid handle) or 1 (invalid value)
-      before the capture shim records anything, so unlike hipArrayCreate these
-      leave no event. They become reachable the moment the matrix runs on a
+      before the capture shim records anything, so these leave no event. They become reachable the moment the matrix runs on a
       part with image support; nothing else has to change.
     apis:
       - hipArrayDestroy
@@ -906,18 +907,6 @@ overrides:
       scope exclusion alongside hipLaunchHostFunc rather than left to fail as
       a bare error 1 from inside the runtime.
 
-  # -- The two array spellings that reach an archive on a part with no images -
-  hipArrayCreate:
-    note: >-
-      Returns 801 (operation not supported) at replay, having returned the same
-      801 at capture: gfx950 reports no image support. Unlike every other
-      member of the array family the capture shim records the call before the
-      runtime rejects it, so this is the one spelling that gets an event.
-      Reproducing the recorded error is the faithful outcome, and the
-      capture-error passthrough says so rather than reporting a handler
-      failure; on a part with images the same handler creates a real array.
-  hipArray3DCreate:
-    note: Same 801 at capture and at replay as hipArrayCreate, 3D spelling.
   hipMemAdvise_v2:
     note: >-
       Used to return 1 (invalid argument) at replay on the same managed range

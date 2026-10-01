@@ -17,7 +17,7 @@
  * the matrix reporter from drifting into disagreeing about what an API is
  * supposed to do at replay.
  *
- * Generated 2026-09-30 from 554 HIP APIs.
+ * Generated 2026-10-01 from 554 HIP APIs.
  */
 
 #pragma once
@@ -543,9 +543,9 @@ inline constexpr HrrApiExpectation kHrrApiMatrix[] = {
     {"hipUserObjectRetain", "T4", 1, false, true, false, false, 0},
     {"__hipRegisterSurface", "T5", 0, false, true, false, false, 0},
     {"__hipRegisterTexture", "T5", 0, false, true, false, false, 0},
-    {"hipArray3DCreate", "T5", 0, false, true, false, false, 0},
+    {"hipArray3DCreate", "T5", 0, false, true, false, false, 1},
     {"hipArray3DGetDescriptor", "T5", 1, false, true, false, false, 1},
-    {"hipArrayCreate", "T5", 0, false, true, false, false, 0},
+    {"hipArrayCreate", "T5", 0, false, true, false, false, 1},
     {"hipArrayDestroy", "T5", 1, false, true, false, false, 1},
     {"hipArrayGetDescriptor", "T5", 1, false, true, false, false, 1},
     {"hipArrayGetInfo", "T5", 1, false, true, false, false, 1},
@@ -720,7 +720,7 @@ inline constexpr HrrTierFloor kHrrTierFloors[] = {
     {"T2", 34, 1, false, kHrrWorkloadsT2},
     {"T3", 20, 2, false, kHrrWorkloadsT3},
     {"T4", 254, 1, false, kHrrWorkloadsT4},
-    {"T5", 14, 1, true, kHrrWorkloadsT5},
+    {"T5", 12, 1, true, kHrrWorkloadsT5},
 };
 
 inline constexpr size_t kHrrTierFloorCount =
