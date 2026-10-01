@@ -17,6 +17,7 @@
 #include "rocjitsu/isa/arch/amdgpu/shared/rdna_isa_base.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <bitset>
 #include <cstddef>
@@ -218,18 +219,9 @@ public:
   /// @brief Invoke @p f with each ordinary single-lane register (SGPR, VGPR,
   /// AccVGPR) in ascending index order. Special singletons are not visited.
   template <typename F> void for_each_ordinary(F &&f) const {
-    for (size_t i = 0; i < sgprs_.size(); ++i) {
-      if (sgprs_.test(i))
-        f(RegisterRef{RegClass::SGPR, static_cast<uint16_t>(i), 1});
-    }
-    for (size_t i = 0; i < vgprs_.size(); ++i) {
-      if (vgprs_.test(i))
-        f(RegisterRef{RegClass::VGPR, static_cast<uint16_t>(i), 1});
-    }
-    for (size_t i = 0; i < acc_vgprs_.size(); ++i) {
-      if (acc_vgprs_.test(i))
-        f(RegisterRef{RegClass::ACC_VGPR, static_cast<uint16_t>(i), 1});
-    }
+    for_each_bits(sgprs_, RegClass::SGPR, f);
+    for_each_bits(vgprs_, RegClass::VGPR, f);
+    for_each_bits(acc_vgprs_, RegClass::ACC_VGPR, f);
   }
 
   /// @brief Invoke @p f with each present special class, in ascending
@@ -256,9 +248,35 @@ private:
   static_assert(widest_special_reg_class() < 16,
                 "special_regs_ must hold a bit for every special RegClass");
 
-  std::bitset<REGISTER_SET_MAX_SGPRS> sgprs_;
-  std::bitset<REGISTER_SET_MAX_VGPRS> vgprs_;
-  std::bitset<REGISTER_SET_MAX_ACC_VGPRS> acc_vgprs_;
+  // Word-sized bitsets expose their value portably, without depending on a
+  // standard library's private std::bitset layout or find-first extensions.
+  // Only expand() writes bits, and clips to the class capacity, so unused bits
+  // in the final word remain zero under all set operations.
+  template <size_t Capacity> using RegisterBits = std::array<std::bitset<64>, (Capacity + 63) / 64>;
+
+  template <size_t Words, typename F>
+  static void for_each_bits(const std::array<std::bitset<64>, Words> &words, RegClass cls, F &f) {
+    for (size_t word = 0; word < Words; ++word) {
+      uint64_t members = words[word].to_ullong();
+      uint64_t bits = members;
+      // Empty words naturally skip the loop; visit only populated bits.
+      while (bits != 0) {
+        const auto bit = std::countr_zero(bits);
+        f(RegisterRef{cls, static_cast<uint16_t>(word * 64 + bit), 1});
+        const uint64_t updated = words[word].to_ullong();
+        // Unchanged words only need their lowest remaining bit cleared. For
+        // callbacks proven not to edit this word, the compiler drops the check.
+        // Otherwise reload edited membership, excluding already visited bits.
+        // The shift is defined also for bit 63, where the mask becomes zero.
+        bits = updated == members ? bits & (bits - 1) : updated & (~uint64_t{1} << bit);
+        members = updated;
+      }
+    }
+  }
+
+  RegisterBits<REGISTER_SET_MAX_SGPRS> sgprs_{};
+  RegisterBits<REGISTER_SET_MAX_VGPRS> vgprs_{};
+  RegisterBits<REGISTER_SET_MAX_ACC_VGPRS> acc_vgprs_{};
 
   /// @brief Bit `static_cast<uint8_t>(cls)` set iff special class `cls` is
   /// present. Only special-class bits are ever set (see `expand`).
