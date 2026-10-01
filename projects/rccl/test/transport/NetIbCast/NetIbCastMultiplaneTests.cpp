@@ -27,6 +27,7 @@
 
 // multiplane public API — include the actual header for ibv_gid and function declarations
 #include "multiplane.h"
+#include "common_cast.h"  // for IbCastAinicRoce
 
 namespace {
 
@@ -98,30 +99,25 @@ TEST(NetIbCastMultiplane, GidToStringAllZeros) {
 }
 
 // =====================================================================
-// 2. IbCastMultiplaneEnabled  (env var gating)
+// 2. IbCastMultiplaneEnabled  (init-time global)
+//
+// IbCastMultiplaneEnable is set once at RCCL init in init.cc.  In tests
+// we simulate this by setting the global directly and verifying that
+// IbCastMultiplaneEnabled() reflects it.
 // =====================================================================
 
-TEST(NetIbCastMultiplane, EnabledWhenEnvSet) {
-  setenv("RCCL_MULTIPLANE_MAP_FILE", "/tmp/dummy.xml", 1);
+TEST_F(MultiplaneLoadTest, EnabledWhenGlobalSet) {
+  IbCastMultiplaneEnable = true;
   bool enabled = false;
   ASSERT_EQ(IbCastMultiplaneEnabled(&enabled), ncclSuccess);
   EXPECT_TRUE(enabled);
-  unsetenv("RCCL_MULTIPLANE_MAP_FILE");
 }
 
-TEST(NetIbCastMultiplane, DisabledWhenEnvUnset) {
-  unsetenv("RCCL_MULTIPLANE_MAP_FILE");
+TEST_F(MultiplaneLoadTest, DisabledByDefault) {
+  // After reset, IbCastMultiplaneEnable is false
   bool enabled = true;
   ASSERT_EQ(IbCastMultiplaneEnabled(&enabled), ncclSuccess);
   EXPECT_FALSE(enabled);
-}
-
-TEST(NetIbCastMultiplane, DisabledWhenEnvEmpty) {
-  setenv("RCCL_MULTIPLANE_MAP_FILE", "", 1);
-  bool enabled = true;
-  ASSERT_EQ(IbCastMultiplaneEnabled(&enabled), ncclSuccess);
-  EXPECT_FALSE(enabled);
-  unsetenv("RCCL_MULTIPLANE_MAP_FILE");
 }
 
 // =====================================================================

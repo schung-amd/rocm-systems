@@ -6,6 +6,7 @@
 
 #include "NetIbMPITestBase.hpp"
 #include "NetIbCastInspect.hpp"
+#include "multiplane.h"
 #include <initializer_list>
 
 // ThreadedCastAgreedNqps returns this when the connection uses one queue pair: real,
@@ -1988,8 +1989,8 @@ TEST_F(NetIbMPITest, CastSubnetAwareRoutingSameSubnet) {
 // routes were wrong (e.g. source==destination for same-host peers),
 // the transfer would fail or time out.
 //
-// Requires: RCCL_MULTIPLANE_MAP_FILE pointing to a valid VIP-to-PIP
-// XML.  Skips cleanly when the env var is unset.
+// Requires: AINIC NIC + RCCL_MULTIPLANE_MAP_FILE pointing to a valid
+// VIP-to-PIP XML.  Skips cleanly when multiplane is not enabled.
 // =============================================================================
 TEST_F(NetIbMPITest, CastMultiplaneConnectionSmoke) {
     SKIP_UNLESS_MPI_PREREQS(kExactTwoProcesses, kExactTwoProcesses,
@@ -1997,14 +1998,15 @@ TEST_F(NetIbMPITest, CastMultiplaneConnectionSmoke) {
 
     const int rank = MPIEnvironment::world_rank;
 
-    const char* mapFile = getenv("RCCL_MULTIPLANE_MAP_FILE");
-    if (mapFile == nullptr || mapFile[0] == '\0') {
-        GTEST_SKIP() << "RCCL_MULTIPLANE_MAP_FILE not set; "
-                        "multiplane smoke test requires a VIP-to-PIP mapping file";
-    }
-
     net_ = &netIbCast;
     AssertInitAndGetDevices(nullptr);
+
+    bool multiplaneOn = false;
+    ASSERT_EQ(IbCastMultiplaneEnabled(&multiplaneOn), ncclSuccess);
+    if (!multiplaneOn) {
+        GTEST_SKIP() << "Multiplane not enabled; "
+                        "smoke test requires AINIC + RCCL_MULTIPLANE_MAP_FILE";
+    }
 
     void* listenComm = nullptr;
     void* sendComm   = nullptr;
@@ -2037,7 +2039,7 @@ TEST_F(NetIbMPITest, CastMultiplaneConnectionSmoke) {
 // to cover both small-message and large-message code paths.  Each size
 // performs a full send/recv cycle with data-integrity verification.
 //
-// Requires: RCCL_MULTIPLANE_MAP_FILE set.  Skips otherwise.
+// Requires: multiplane enabled (AINIC + RCCL_MULTIPLANE_MAP_FILE).  Skips otherwise.
 // =============================================================================
 TEST_F(NetIbMPITest, CastMultiplaneMultiSizeTransfer) {
     SKIP_UNLESS_MPI_PREREQS(kExactTwoProcesses, kExactTwoProcesses,
@@ -2045,13 +2047,14 @@ TEST_F(NetIbMPITest, CastMultiplaneMultiSizeTransfer) {
 
     const int rank = MPIEnvironment::world_rank;
 
-    const char* mapFile = getenv("RCCL_MULTIPLANE_MAP_FILE");
-    if (mapFile == nullptr || mapFile[0] == '\0') {
-        GTEST_SKIP() << "RCCL_MULTIPLANE_MAP_FILE not set";
-    }
-
     net_ = &netIbCast;
     AssertInitAndGetDevices(nullptr);
+
+    bool multiplaneOn = false;
+    ASSERT_EQ(IbCastMultiplaneEnabled(&multiplaneOn), ncclSuccess);
+    if (!multiplaneOn) {
+        GTEST_SKIP() << "Multiplane not enabled";
+    }
 
     void* listenComm = nullptr;
     void* sendComm   = nullptr;
@@ -2088,10 +2091,10 @@ TEST_F(NetIbMPITest, CastMultiplaneMultiSizeTransfer) {
 // =============================================================================
 // Test: CastMultiplaneDisabledNoRegression
 //
-// Verifies that when RCCL_MULTIPLANE_MAP_FILE is NOT set, the connection
-// setup and data transfer work identically to the non-multiplane path.
-// This is a backward-compatibility guard: the multiplane code in connect.cc
-// must be completely inert when the env var is absent.
+// Verifies that when multiplane is not enabled, the connection setup and
+// data transfer work identically to the non-multiplane path.  This is a
+// backward-compatibility guard: the multiplane code in connect.cc must be
+// completely inert when multiplane is disabled.
 // =============================================================================
 TEST_F(NetIbMPITest, CastMultiplaneDisabledNoRegression) {
     SKIP_UNLESS_MPI_PREREQS(kExactTwoProcesses, kExactTwoProcesses,
@@ -2099,18 +2102,18 @@ TEST_F(NetIbMPITest, CastMultiplaneDisabledNoRegression) {
 
     const int rank = MPIEnvironment::world_rank;
 
-    // Explicitly ensure multiplane is NOT configured.
-    // If someone runs the suite with the env var set, this test verifies
-    // that unsetting it mid-process still results in correct behavior
-    // for new connections.
-    const char* mapFile = getenv("RCCL_MULTIPLANE_MAP_FILE");
-    if (mapFile != nullptr && mapFile[0] != '\0') {
-        GTEST_SKIP() << "RCCL_MULTIPLANE_MAP_FILE is set; this test validates "
-                        "the disabled (no-multiplane) path";
-    }
-
     net_ = &netIbCast;
     AssertInitAndGetDevices(nullptr);
+
+    // Use the same check the library uses — IbCastMultiplaneEnabled reads
+    // the init-time global that accounts for AINIC detection and ncclGetEnv
+    // (which includes .rccl.conf and the env plugin, not just getenv).
+    bool multiplaneOn = false;
+    ASSERT_EQ(IbCastMultiplaneEnabled(&multiplaneOn), ncclSuccess);
+    if (multiplaneOn) {
+        GTEST_SKIP() << "Multiplane is enabled; this test validates "
+                        "the disabled (no-multiplane) path";
+    }
 
     void* listenComm = nullptr;
     void* sendComm   = nullptr;

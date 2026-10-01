@@ -7,6 +7,7 @@
 
 #include "multiplane.h"
 #include "net_ib_cast_inspect.h"
+#include "common_cast.h"
 #include "core.h"
 
 #include <arpa/inet.h>
@@ -223,8 +224,9 @@ ncclResult_t IbCastMultiplaneLoad(void) {
 }
 
 ncclResult_t IbCastMultiplaneEnabled(bool* enabled) {
-  const char* mapFile = ncclGetEnv("RCCL_MULTIPLANE_MAP_FILE");
-  *enabled = (mapFile != NULL && mapFile[0] != '\0');
+  // IbCastMultiplaneEnable is set once during RCCL init (init.cc) based on
+  // IbCastAinicRoce && RCCL_MULTIPLANE_MAP_FILE — no per-QP overhead.
+  *enabled = IbCastMultiplaneEnable;
   return ncclSuccess;
 }
 
@@ -274,4 +276,6 @@ void ncclIbCastTestMultiplaneReset(void) {
   loadOnceFlag.~once_flag();
   new (&loadOnceFlag) std::once_flag();
   loadResult = ncclSuccess;
+  // Reset the init-time global so tests can toggle between enabled/disabled.
+  IbCastMultiplaneEnable = false;
 }
